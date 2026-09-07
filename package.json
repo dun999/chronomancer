@@ -1,0 +1,36 @@
+{
+  "name": "chronomancer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Telegram AI assistant for DreamDEX Event Contracts on Somnia testnet",
+  "scripts": {
+    "dev": "tsx src/bot.ts",
+    "web": "tsx src/server.ts",
+    "e2e": "tsx src/e2e.ts",
+    "test": "tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "deploy:trophies": "tsx scripts/deploy-trophies.ts",
+    "check:assistant": "tsx scripts/assistant-check.ts",
+    "dev:legacy": "tsx src/legacy-bot.ts",
+    "check:agent": "tsx scripts/agent-check.ts"
+  },
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "@somnia-chain/markets-sdk": "^0.29.0",
+    "dotenv": "^16.4.5",
+    "telegraf": "^4.16.3",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
