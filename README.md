@@ -1,5 +1,7 @@
 # Chronomancer — DreamDEX event contracts, in a Telegram chat
 
+<img width="1284" height="2601" alt="image" src="https://github.com/user-attachments/assets/a84318e7-4364-474c-a145-56041988e521" />
+
 A Telegram bot that turns **DreamDEX Event Contracts on Somnia Shannon testnet**
 into a conversation. It makes you a wallet, shows you the real two-sided book,
 takes an order in plain words, and hands back a mined receipt with the fills that
