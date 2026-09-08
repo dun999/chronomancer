@@ -249,7 +249,7 @@ current `npm run dev` entry point shares none of their state.
   a request can go unanswered or be refused for an address with no history. If
   nothing arrives, send tUSDC from another funded testnet address, or retry the
   faucet later. `/wallet` shows the address and re-reads both balances on chain,
-  so you can tell funding apart from a bot problem.
+  so you can tell funding apart from a bot problem. (Update: i think its bot/RPC issue)
 - Live submission needs acceptance testing with a freshly funded testnet wallet.
   Automated tests mock execution; read-only checks never spend or prove a fill.
 - Indexed P/L can lag the chain. When it disagrees with on-chain holdings the card
