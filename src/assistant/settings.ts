@@ -18,6 +18,15 @@ export const settings = {
   collateralFaucet: 'https://t.me/+XHq0F0JXMyhmMzM0',
   maxBudget: '100',
   minSeconds: 120,
+  // Telegraf aborts a handler at `handlerTimeout` and, by default, that abort
+  // tears down long polling. The internal budgets below must always expire
+  // first so the user gets an answer and the poller keeps running:
+  // markets + news + two AI attempts < handlerTimeoutMs.
+  handlerTimeoutMs: Math.max(Number(process.env.HANDLER_TIMEOUT_MS) || 150_000, 30_000),
+  // The live indexer needs 8-16s for a full page of eight markets and their
+  // books, so this is roughly double the worst measured read, not a tight cap.
+  marketTimeoutMs: Math.max(Number(process.env.MARKET_TIMEOUT_MS) || 35_000, 5_000),
+  newsTimeoutMs: Math.max(Number(process.env.NEWS_TIMEOUT_MS) || 5_000, 1_000),
 };
 export const chain = {
   id: 50312, name: 'Somnia Shannon Testnet',

@@ -5,7 +5,7 @@ import { settings } from './assistant/settings.js';
 import { Ledger } from './assistant/ledger.js';
 import { Wallets } from './assistant/wallets.js';
 import { DreamDex, PreflightError } from './assistant/dreamdex.js';
-import { askAgent } from './assistant/agent.js';
+import { askAgent, AgentError } from './assistant/agent.js';
 import { escape, positionCard } from './assistant/cards.js';
 import { money } from './assistant/math.js';
 import type { ActionKind, MarketView, Side } from './assistant/types.js';
@@ -20,6 +20,11 @@ type Ref = {op:string; marketId?:string; side?:Side; kind?:ActionKind; amount?:s
 type Services = {ledger: Ledger; wallets: Wallets; dex: DreamDex; agent: typeof askAgent};
 const uid = (ctx: Context) => String(ctx.from!.id);
 const keyboard = (rows: ReturnType<typeof Markup.button.callback>[][]) => ({parse_mode:'HTML' as const,...Markup.inlineKeyboard(rows)});
+/** A slow indexer or RPC must not outlast the Telegram handler: stop waiting
+ *  and answer, rather than letting Telegraf abort the whole update. */
+const withTimeout = <T,>(work: Promise<T>, ms: number, what: string) => Promise.race([
+  work, new Promise<never>((_,reject)=>setTimeout(()=>reject(new PreflightError(`${what} is taking too long right now. Please try again in a moment.`)),ms).unref()),
+]);
 const fmt = (raw: string, m: MarketView) => formatUnits(BigInt(raw),m.decimals);
 const odds = (raw: string|null, m: MarketView) => raw === null ? 'no asks' : `${(Number(fmt(raw,m))*100).toFixed(1)}¢`;
 
@@ -29,18 +34,32 @@ export function buildBot(injected?: Services, token = settings.token) {
   const wallets = injected?.wallets ?? new Wallets(ledger,settings.dataDir,settings.masterKey);
   const dex = injected?.dex ?? new DreamDex(wallets);
   const agent = injected?.agent ?? askAgent;
-  const bot = new Telegraf(token);
-  const busy = new Set<string>();
+  const bot = new Telegraf(token,{handlerTimeout:settings.handlerTimeoutMs});
+  // Deadlines, not flags: an abandoned handler must never lock its user out for
+  // good. The guard holds for exactly as long as Telegraf will still run the
+  // handler, so it stops double submissions without outliving them.
+  const busy = new Map<string,number>();
   const session = (id: string) => ledger.session<Session>(id,{history:[],marketIds:[]});
   const button = (id:string, title:string, ref:Ref) => Markup.button.callback(title,`r:${ledger.ref(id,ref)}`);
   const user = (ctx:Context) => wallets.ensure(uid(ctx),ctx.from!.first_name);
 
+  // Telegraf's default handler rethrows, and that rejection aborts the
+  // long-polling loop: one over-long handler leaves a live process that
+  // silently ignores every later message. Log it, answer the user, keep polling.
+  bot.catch(async (e,ctx) => {
+    const timedOut = (e as Error).name === 'TimeoutError';
+    // Do not print provider responses, Telegram URLs, private keys or signed transactions.
+    console.error('Update handling failed:', timedOut ? `handler exceeded ${settings.handlerTimeoutMs}ms` : e instanceof Error ? e.name : 'UnknownError');
+    await ctx.reply(timedOut
+      ? 'That took longer than I can wait, so I stopped. Please try again — /market and /positions still work.'
+      : 'That request could not be completed. Check /activity for transaction status, or try the read again.').catch(()=>undefined);
+  });
   bot.use(async (ctx,next) => {
     if (!ctx.from || ctx.from.is_bot) return;
     if (ctx.chat?.type !== 'private') { await ctx.reply('Open a private chat with me to create your wallet and trade.'); return; }
-    if (busy.has(uid(ctx))) { if (ctx.callbackQuery) await ctx.answerCbQuery('Still working on your previous request.'); return; }
+    if ((busy.get(uid(ctx)) ?? 0) > Date.now()) { if (ctx.callbackQuery) await ctx.answerCbQuery('Still working on your previous request.'); return; }
     if (!ledger.claimUpdate(ctx.update.update_id)) return;
-    busy.add(uid(ctx));
+    busy.set(uid(ctx),Date.now()+settings.handlerTimeoutMs);
     try { await next(); }
     catch(e) {
       await ctx.reply(e instanceof PreflightError ? e.message : 'That request could not be completed. Check /activity for transaction status, or try the read again.').catch(()=>undefined);
@@ -70,10 +89,24 @@ export function buildBot(injected?: Services, token = settings.token) {
       ...(u.stage>=2 ? [[button(u.id,'Open markets',{op:'markets',page:0})]] : []),
     ]));
   });
+  async function unavailableReply(ctx:Context, request:string) {
+    const u=user(ctx), s=session(u.id);
+    try {
+      const d=await agent(request,[],s.history,undefined,'unavailable');
+      s.history=[...s.history,{role:'user',content:request},{role:'assistant',content:d.reply}].slice(-8) as Session['history'];
+      ledger.setSession(u.id,s);
+      await ctx.reply(escape(d.reply),{parse_mode:'HTML'});
+    } catch {
+      await ctx.reply('Sorry, I can’t reach live market data, and my AI service could not answer either. Please try again in a moment.');
+    }
+  }
   async function marketList(ctx:Context,page=0) {
     const u = user(ctx);
     await ctx.reply('Checking open DreamDEX markets…');
-    const result = await dex.markets(page), s = session(u.id);
+    let result;
+    try { result = await withTimeout(dex.markets(page),settings.marketTimeoutMs,'The market list'); }
+    catch { await unavailableReply(ctx, '/market: show me the open markets'); return; }
+    const s = session(u.id);
     s.marketIds = result.markets.map(m=>m.id); ledger.setSession(u.id,s);
     const lines = result.markets.map((m,i)=>`<b>${i+1}. ${escape(m.asset)} · ${new Date(m.expiry*1000).toISOString().slice(11,16)} UTC</b>\n${escape(m.question.slice(0,150))}\nUp ${odds(m.upAsk,m)} · Down ${odds(m.downAsk,m)} · ${m.id.slice(0,10)}…`);
     const rows = result.markets.map(m=>[button(u.id,`${m.asset} · ${new Date(m.expiry*1000).toISOString().slice(11,16)} UTC · ${m.id.slice(2,8)}`,{op:'market',marketId:m.id})]);
@@ -82,7 +115,7 @@ export function buildBot(injected?: Services, token = settings.token) {
     await ctx.reply(`<b>Open markets · tUSDC</b>\n\n${lines.join('\n\n') || 'No tradable markets on this page. Check the next page or refresh shortly.'}\n\nPrices are current asks, not AI confidence. Tap a market, or ask “find a good opportunity.”`,keyboard(rows));
   }
   async function marketDetail(ctx:Context,id:string) {
-    const u = user(ctx), m = await dex.market(id);
+    const u = user(ctx), m = await withTimeout(dex.market(id),settings.marketTimeoutMs,'This market');
     await ctx.reply(`<b>${escape(m.asset)} · Choose your side</b>\n${escape(m.question)}\n\nUp: ${odds(m.upAsk,m)}\nDown: ${odds(m.downAsk,m)}\nCloses: ${new Date(m.expiry*1000).toISOString()}\nMarket: <code>${m.id}</code>\n\nYou’ll review the budget and price limit before placing a trade.`,keyboard([
       [button(u.id,'↗ Buy Up',{op:'amount',marketId:id,side:'Up',kind:'buy'}),button(u.id,'↘ Buy Down',{op:'amount',marketId:id,side:'Down',kind:'buy'})],
       [button(u.id,'Advanced · complete sets / limit orders',{op:'advanced',marketId:id})],
@@ -263,13 +296,25 @@ export function buildBot(injected?: Services, token = settings.token) {
     }
     if(Date.now()-(s.lastAi??0)<8000){await ctx.reply('Give me a few seconds before the next AI request.');return;}
     s.lastAi=Date.now();ledger.setSession(u.id,s);
-    await ctx.reply('Let me check the current markets…');
-    const {markets}=await dex.markets(0);
+    let markets:MarketView[];
+    try { ({markets}=await withTimeout(dex.markets(0),settings.marketTimeoutMs,'The market list')); }
+    catch { await unavailableReply(ctx,text); return; }
     if(s.selected && !markets.some(m=>m.id===s.selected!.marketId)){
       try{markets.push(await dex.market(s.selected.marketId));}catch{/* stale context does not force a market */}
     }
     let d;
-    try{d=await agent(text,markets,s.history,s.selected);}catch(e){await ctx.reply(settings.aiKey&&settings.aiModel?'The AI is unavailable right now. /market and /positions still work.': 'AI is not configured yet. You can still use /market and trade with buttons, or check /positions.');return;}
+    // Each failure gets its own sentence: "unavailable" for a slow model is
+    // wrong, and it hides a provider that is actually returning broken JSON.
+    try{d=await agent(text,markets,s.history,s.selected);}
+    catch(e){
+      const kind=e instanceof AgentError?e.kind:'invalid';
+      await ctx.reply(
+        kind==='unconfigured' ? 'AI is not configured yet. You can still use /market and trade with buttons, or check /positions.' :
+        kind==='timeout' ? 'The AI took too long to answer. Ask me again in a moment — /market and /positions still work.' :
+        kind==='http' ? 'The AI service is unavailable right now. /market and /positions still work.' :
+        'I could not read the AI’s answer just now. Ask me again, or use /market and /positions.');
+      return;
+    }
     s.history=[...s.history,{role:'user',content:text},{role:'assistant',content:d.reply}].slice(-8) as Session['history'];
     ledger.setSession(u.id,s);
     if(d.intent==='positions')return positions(ctx);
@@ -292,9 +337,26 @@ export function buildBot(injected?: Services, token = settings.token) {
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){
   const runtime=buildBot();
-  process.once('SIGINT',()=>{runtime.bot.stop('SIGINT');runtime.close();process.exit(0);});
-  process.once('SIGTERM',()=>{runtime.bot.stop('SIGTERM');runtime.close();process.exit(0);});
+  let stopping=false;
+  const shutdown=(code:number,reason:string)=>{
+    if(stopping)return; stopping=true;
+    if(code)console.error(`Chronomancer is exiting: ${reason}`);
+    try{runtime.bot.stop(reason);}catch{/* polling may already be down */}
+    try{runtime.close();}catch{/* best effort during shutdown */}
+    process.exitCode=code;
+    // The RPC websocket and indexer sockets can hold the loop open forever, and
+    // a process that lingers after polling died looks healthy to systemd while
+    // ignoring every message. Leave, so Restart= brings a working bot back.
+    setTimeout(()=>process.exit(code),5000).unref();
+  };
+  process.once('SIGINT',()=>shutdown(0,'SIGINT'));
+  process.once('SIGTERM',()=>shutdown(0,'SIGTERM'));
+  process.on('uncaughtException',e=>shutdown(1,`uncaught ${e instanceof Error?e.name:'exception'}`));
+  process.on('unhandledRejection',e=>shutdown(1,`unhandled rejection: ${e instanceof Error?e.name:'unknown'}`));
+  // launch() settles only when long polling ends. Either way that is the end of
+  // the bot's usefulness, so it must end the process too.
   runtime.bot.launch(() => {
-    console.log(`Telegram connected: @${runtime.bot.botInfo?.username}; AI: ${settings.aiProvider}/${settings.aiModel}`);
-  }).catch(()=>{console.error('Telegram launch failed. Check token/network and ensure only one polling instance runs.');runtime.close();process.exitCode=1;});
+    console.log(`Telegram connected: @${runtime.bot.botInfo?.username}; AI: ${settings.aiProvider}/${settings.aiModel} (${settings.aiTimeoutMs}ms/attempt, handler ${settings.handlerTimeoutMs}ms)`);
+  }).then(()=>shutdown(1,'long polling stopped'))
+    .catch(()=>shutdown(1,'Telegram launch failed. Check token/network and ensure only one polling instance runs.'));
 }

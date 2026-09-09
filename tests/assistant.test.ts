@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -7,7 +7,8 @@ import { Ledger } from '../src/assistant/ledger.js';
 import { Wallets } from '../src/assistant/wallets.js';
 import { receiptFills, sizeBudget, units } from '../src/assistant/math.js';
 import { cardSvg, positionCard } from '../src/assistant/cards.js';
-import { validateDecision } from '../src/assistant/agent.js';
+import { AgentError, askAgent, parseAgentJson, validateDecision } from '../src/assistant/agent.js';
+import { settings } from '../src/assistant/settings.js';
 import type { MarketView, Quote, PositionView } from '../src/assistant/types.js';
 export const market:MarketView={id:`0x${'a'.repeat(64)}`,pool:`0x${'b'.repeat(40)}`,asset:'BTC',question:'Will BTC close above its opening price?',expiry:Math.floor(Date.now()/1000)+3600,tradingStart:Math.floor(Date.now()/1000)-60,decimals:6,venueId:'test',upAsk:'450000',downAsk:'570000',upBid:'430000',downBid:'550000'};
 export const quote:Quote={kind:'buy',market,side:'Up',amount:'10',quantity:'20000000',price:'470000',maxCost:'9400000',minReceive:'0',expiresAt:Date.now()+60000};
@@ -72,4 +73,68 @@ test('agent cannot invent a market or cite missing evidence',()=>{
  const base={intent:'opportunities',reply:'Review these carefully.',marketId:null,side:null,amount:null,picks:[{marketId:market.id,side:'Up',conviction:'medium',reason:'Example',evidence:['https://invented.test']}]};
  assert.equal(validateDecision(base,[market],[]).picks.length,0);
  assert.throws(()=>validateDecision({...base,marketId:'0xdead'},[market],[]));
+});
+test('a decision survives Markdown fences and surrounding prose, and a truly broken reply is typed',()=>{
+ const object={intent:'explain',reply:'Up and Down shares form a set.',marketId:null,side:null,amount:null,picks:[]};
+ const json=JSON.stringify(object);
+ for(const raw of [json,`\n${json}\n`,'```json\n'+json+'\n```','```\n'+json+'\n```',
+   `Sure! Here is the decision:\n${json}\nLet me know if you want more.`,
+   'Here you go:\n```json\n'+json+'\n```\nHope that helps.'])
+  assert.deepEqual(parseAgentJson(raw),object,`failed to recover from: ${raw.slice(0,40)}`);
+ // Braces inside strings must not end the object early.
+ assert.equal((parseAgentJson('prefix {"reply":"a } brace","picks":[]} suffix') as {reply:string}).reply,'a } brace');
+ for(const broken of ['','not json at all','{"intent":']){
+  assert.throws(()=>parseAgentJson(broken),(e:unknown)=>e instanceof AgentError&&e.kind==='invalid'&&e.retryable);
+ }
+});
+/** The first call after a restart pays for DNS and TLS and was measured past
+ *  30s on the live box while warm calls took four; one retry recovers it. A
+ *  fenced or prose-wrapped reply must not cost the user their answer either. */
+test('a cold-start timeout and an unreadable reply are each retried once, inside one budget',async()=>{
+ const saved={...settings},decision={intent:'explain',reply:'Up and Down form a set.',marketId:null,side:null,amount:null,picks:[]};
+ const reply=(content:string)=>new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content}}]}),{status:200,headers:{'Content-Type':'application/json'}});
+ const scenarios:Array<{name:string;first:()=>Promise<Response>}>=[
+  {name:'cold-start timeout',first:async()=>{const e=new Error('timed out');e.name='TimeoutError';throw e;}},
+  {name:'markdown fence with prose',first:async()=>reply('Sure!\n```json\n{"broken":\n```')},
+  {name:'gateway 503',first:async()=>new Response('busy',{status:503})},
+ ];
+ try{
+  Object.assign(settings,{aiKey:'test-key',aiModel:'test-model',aiApi:'chat',aiProvider:'openrouter',
+   aiEndpoint:'https://example.test/v1/chat/completions',aiTimeoutMs:5_000,newsKey:''});
+  for(const s of scenarios){
+   let calls=0;
+   const fetchMock=mock.method(globalThis,'fetch',async()=>{calls++;return calls===1?s.first():reply('```json\n'+JSON.stringify(decision)+'\n```');});
+   try{
+    const d=await askAgent('Explain DreamDEX.',[],[]);
+    assert.equal(calls,2,`${s.name}: expected exactly one retry`);
+    assert.equal(d.intent,'explain',`${s.name}: the recovered decision is used`);
+    assert.equal(d.reply,decision.reply);
+   }finally{fetchMock.mock.restore();}
+  }
+  // A retry must never outlive the budget: both attempts fail, one error surfaces.
+  const always=mock.method(globalThis,'fetch',async()=>new Response('busy',{status:503}));
+  try{
+   const started=Date.now();
+   await assert.rejects(()=>askAgent('Explain DreamDEX.',[],[]),(e:unknown)=>e instanceof AgentError&&e.kind==='http');
+   assert(Date.now()-started<settings.aiTimeoutMs*2,'the whole call stays inside its deadline');
+   assert.equal(always.mock.callCount(),2,'it stops after the retry rather than looping');
+  }finally{always.mock.restore();}
+ }finally{Object.assign(settings,saved);}
+});
+
+test('unavailable market context tells the model to answer and removes stale trading output',async()=>{
+ const saved={...settings};let body:any;
+ Object.assign(settings,{aiKey:'test',aiModel:'test',aiApi:'chat',newsKey:''});
+ const fetchMock=mock.method(globalThis,'fetch',async(_url:any,options:any)=>{
+  body=JSON.parse(options.body);
+  return new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify({intent:'buy',reply:'Sorry, live data is unavailable. I can explain complete sets.',marketId:market.id,side:'Up',amount:'10',picks:[{marketId:market.id}]})}}]}));
+ });
+ try{
+  const result=await askAgent('explain complete sets',[market],[],{marketId:market.id,side:'Up'},'unavailable');
+  assert.match(body.messages[0].content,/Live market data status: unavailable/);
+  const context=JSON.parse(body.messages.at(-1).content);
+  assert.deepEqual(context.markets,[]);assert.equal(context.selected,undefined);
+  assert.equal(result.intent,'explain');assert.equal(result.marketId,null);assert.equal(result.amount,null);assert.deepEqual(result.picks,[]);
+  assert.match(result.reply,/explain complete sets/);
+ }finally{fetchMock.mock.restore();Object.assign(settings,saved);}
 });
