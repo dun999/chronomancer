@@ -265,6 +265,7 @@ current `npm run dev` entry point shares none of their state.
   operator investigation. Never blindly clear the journal or resend. There is no
   automatic private-key export or withdrawal UI.
 - tUSDC is test money. A testnet transaction is not a real-dollar settlement.
+- LLM Latency need around 7s to respond
 
 ## References
 
