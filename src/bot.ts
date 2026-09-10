@@ -27,6 +27,9 @@ const withTimeout = <T,>(work: Promise<T>, ms: number, what: string) => Promise.
 ]);
 const fmt = (raw: string, m: MarketView) => formatUnits(BigInt(raw),m.decimals);
 const odds = (raw: string|null, m: MarketView) => raw === null ? 'no asks' : `${(Number(fmt(raw,m))*100).toFixed(1)}¢`;
+const plainRequest = (text:string) => text.toLowerCase().replace(/[.!?]+$/,'').replace(/\s+/g,' ').trim();
+const closeRequest = (text:string) => /^(?:(?:can|could|would|will) you )?(?:please )?(?:close|exit|cash out|sell) (?:(?:all|every) )?(?:(?:of )?my )?positions?$/.test(plainRequest(text));
+const positionRequest = (text:string) => /^(?:(?:can|could|would|will) you )?(?:please )?(?:(?:show|check|list|view|open) )?(?:(?:all|every) )?(?:(?:of )?my )?positions?$/.test(plainRequest(text));
 
 export function buildBot(injected?: Services, token = settings.token) {
   if (!token) throw new Error('Set TELEGRAM_BOT_TOKEN before starting the bot.');
@@ -89,9 +92,15 @@ export function buildBot(injected?: Services, token = settings.token) {
       [button(u.id,'Confirm transaction',{op:'confirm',actionId:action.id}),button(u.id,'Cancel',{op:'cancel',actionId:action.id})],
     ]));
   }
-  async function exitPosition(ctx:Context,ref?:Ref) {
+  async function exitPosition(ctx:Context,ref?:Ref,all=false) {
     const u=user(ctx),s=session(u.id);
-    if(!ref?.marketId){await positions(ctx);await ctx.reply('Choose the position, then tap Close position · exit options.');return;}
+    if(!ref?.marketId){
+      await positions(ctx);
+      await ctx.reply(all
+        ? 'Choose a position to close. I handle them one at a time so you can review the available route and each transaction.'
+        : 'Choose the position, then tap Close position · exit options.');
+      return;
+    }
     const side=ref.side ?? 'Up', options=await dex.exitOptions(u.address,ref.marketId,side);
     s.selected={marketId:ref.marketId,side};delete s.awaiting;ledger.setSession(u.id,s);
     await ctx.reply(`<b>Exit assistant · ${escape(options.market.asset)} ${side}</b>\nMarket: <code>${options.market.id}</code>\nHeld: ${fmt(options.held,options.market)} ${side} shares\nComplete pairs: ${fmt(options.pairs,options.market)}\n\n${escape(options.note)}\n\nNo action has been submitted. After a confirmed close or claim, /wallet shows available collateral and /withdraw lets you send it.`,keyboard([
@@ -314,14 +323,16 @@ export function buildBot(injected?: Services, token = settings.token) {
   bot.on('text',async ctx=>{
     const u=user(ctx), text=ctx.message.text.trim(), s=session(u.id);
     if(/^(?:please\s+)?(?:send|transfer|withdraw)\b/i.test(text))return transfer(ctx,text);
-    if(/^(?:please\s+)?(?:close|exit|cash out|sell)\b/i.test(text)) {
-      // Ambiguous references always open the user's position picker.
-      if(s.selected && /^(?:please\s+)?(?:close|exit|cash out|sell) (?:this|my|the) position[.!]?$/i.test(text))return exitPosition(ctx,{op:'exit',...s.selected});
-      return exitPosition(ctx);
+    if(closeRequest(text)) {
+      const all=/\b(?:all|every)\b/i.test(text) || /\bpositions\b/i.test(text);
+      // A singular request can use the position the user most recently opened.
+      // A plural/all request always shows the picker instead of guessing scope.
+      if(s.selected && !all)return exitPosition(ctx,{op:'exit',...s.selected});
+      return exitPosition(ctx,undefined,all);
     }
     if(/^(?:please\s+)?(?:claim|redeem)\b/i.test(text))return redeem(ctx);
     if(/^(?:show |check )?(?:my )?(?:wallet|balance)[.!]?$/i.test(text))return wallet(ctx);
-    if(/\b(check|show|my)\b.*\bpositions?\b/i.test(text)) return positions(ctx);
+    if(positionRequest(text) || /\b(check|show|my)\b.*\bpositions?\b/i.test(text)) return positions(ctx);
     if(/^\/|^help$/i.test(text)){await ctx.reply('Use /help to see the commands.');return;}
     if(s.awaiting && /^\$?\d+(\.\d+)?(?:\s+\d+(\.\d+)?)?$/.test(text)){
       const [amount,price]=text.replace(/^\$/,'').split(/\s+/);
