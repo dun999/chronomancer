@@ -139,9 +139,9 @@ test('exit and transfer conversations create owner-bound reviews, never execute 
  const dir=mkdtempSync(join(tmpdir(),'bot-exit-')),ledger=new Ledger(dir),wallets=new Wallets(ledger,dir);
  const market:MarketView={id:`0x${'a'.repeat(64)}`,pool:`0x${'b'.repeat(40)}`,asset:'BTC',question:'BTC Up?',expiry:Date.now()/1000+3600,tradingStart:0,decimals:6,venueId:'test',upAsk:'450000',downAsk:'570000',upBid:'430000',downBid:'550000'};
  const recipient=`0x${'2'.repeat(40)}` as const;
- const sent:any[]=[];let update=0,writes=0,ai=0;
+ const sent:any[]=[];let update=0,writes=0,ai=0,plans=0;
  const api=mock.method(Telegram.prototype,'callApi',async(_method:string,payload:any)=>{sent.push(payload);return {message_id:sent.length,chat:{id:1,type:'private'}} as any;});
- const dex={close(){},portfolio:async()=>[{market:{id:market.id,asset:'BTC'},balanceYes:8000000n,balanceNo:0n}],exitOptions:async()=>({market,held:'8000000',pairs:'3000000',note:'Merge paired shares; sale may partially fill.',choices:[{kind:'merge',side:'Up',amount:'3',label:'Review complete-set merge'},{kind:'sell',side:'Up',amount:'8',label:'Review sale of held shares'}]}),
+ const dex={close(){},portfolio:async()=>[{market:{id:market.id,asset:'BTC'},balanceYes:8000000n,balanceNo:0n}],exitOptions:async()=>{plans++;return {market,held:'8000000',pairs:'3000000',note:'Merge paired shares; sale may partially fill.',choices:[{kind:'merge',side:'Up',amount:'3',label:'Review complete-set merge'},{kind:'sell',side:'Up',amount:'8',label:'Review sale of held shares'}]};},
   market:async()=>market,quote:async(kind:any,m:any,side:any,amount:any)=>({kind,market:m,side,amount,quantity:kind==='merge'?'3000000':'8000000',price:'430000',maxCost:'0',minReceive:'0',expiresAt:Date.now()+60000}),
   transferQuote:async(_owner:string,dest:string,amount:string)=>{assert.equal(dest,recipient);assert.equal(amount,'10');return {kind:'withdraw',asset:'tUSDC',recipient,token:market.pool,chainId:50312,decimals:6,amount,quantity:'10000000',expiresAt:Date.now()+60000};},
   execute:async(_id:string,_address:string,q:any)=>{writes++;return {hash:`0x${'c'.repeat(64)}`,filled:q.kind==='sell'?'2':'0',cash:'10',summary:q.kind==='sell'?'2 Up shares filled. Unfilled remainder cancelled.':`Sent 10 tUSDC to ${recipient}`};},
@@ -154,7 +154,9 @@ test('exit and transfer conversations create owner-bound reviews, never execute 
  try{
   wallets.ensure('1','Alice');ledger.setSession('1',{selected:{marketId:market.id,side:'Up'},history:[],marketIds:[]});
   await message('all position');assert(button('BTC Up · aaaaaa'));assert.equal(ai,0);
-  await message('close all position');assert.match(sent.at(-1).text,/one at a time/);assert.equal(ai,0);assert.equal(writes,0);
+  await message('close all position');assert(sent.some(p=>p.text?.includes('exit routes for everything you hold')));assert(button('Review sale · 8 Up'));assert.equal(plans,1);assert.equal(ai,0);assert.equal(writes,0);
+  await message('all');assert.equal(plans,2);assert(button('Review sale · 8 Up'));assert.equal(ai,0);assert.equal(writes,0);
+  await message('close all position, its all, i dont care about tusdc');assert.equal(plans,3);assert(button('Review sale · 8 Up'));assert.equal(ai,0);assert.equal(writes,0);
   await message('close my position');assert(sent.at(-1).text.includes('Exit assistant'));assert.equal(writes,0);
   await click(button('Review sale of held shares'));const sale=button('Confirm transaction');
   assert.equal(ledger.actions('1')[0].quote.kind,'sell');assert.equal(writes,0);

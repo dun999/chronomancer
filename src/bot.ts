@@ -13,6 +13,8 @@ import type { ActionKind, MarketView, Side } from './assistant/types.js';
 type Session = {
   selected?: {marketId: string; side: Side};
   awaiting?: {marketId: string; side: Side; kind: ActionKind};
+  mode?: 'close_all';
+  modeAt?: number;
   history: Array<{role:'user'|'assistant';content:string}>;
   marketIds: string[]; lastAi?: number;
 };
@@ -28,6 +30,12 @@ const withTimeout = <T,>(work: Promise<T>, ms: number, what: string) => Promise.
 const fmt = (raw: string, m: MarketView) => formatUnits(BigInt(raw),m.decimals);
 const odds = (raw: string|null, m: MarketView) => raw === null ? 'no asks' : `${(Number(fmt(raw,m))*100).toFixed(1)}¢`;
 const plainRequest = (text:string) => text.toLowerCase().replace(/[.!?]+$/,'').replace(/\s+/g,' ').trim();
+const closeAllRequest = (text:string) => {
+  const value=plainRequest(text);
+  return /\b(?:close|exit|sell)\b.*\b(?:all|every)\b.*\bpositions?\b/.test(value) ||
+    /\bcash out\b.*\b(?:all|every)\b.*\bpositions?\b/.test(value) ||
+    /\b(?:close|exit|sell)\b.*\bpositions?\b.*\b(?:all|every)\b/.test(value);
+};
 const closeRequest = (text:string) => /^(?:(?:can|could|would|will) you )?(?:please )?(?:close|exit|cash out|sell) (?:(?:all|every) )?(?:(?:of )?my )?positions?$/.test(plainRequest(text));
 const positionRequest = (text:string) => /^(?:(?:can|could|would|will) you )?(?:please )?(?:(?:show|check|list|view|open) )?(?:(?:all|every) )?(?:(?:of )?my )?positions?$/.test(plainRequest(text));
 
@@ -45,6 +53,25 @@ export function buildBot(injected?: Services, token = settings.token) {
   const session = (id: string) => ledger.session<Session>(id,{history:[],marketIds:[]});
   const button = (id:string, title:string, ref:Ref) => Markup.button.callback(title,`r:${ledger.ref(id,ref)}`);
   const user = (ctx:Context) => wallets.ensure(uid(ctx),ctx.from!.first_name);
+
+  async function heldPositions(userId:string,address:`0x${string}`) {
+    const found:Array<{marketId:string;side:Side;label:string}>=[];
+    for (const a of ledger.actions(userId).filter(a=>a.state==='confirmed')) {
+      const q=a.quote;
+      if(q.kind==='withdraw')continue;
+      if (['cancel','redeem'].includes(q.kind) || (['buy','sell','limit'].includes(q.kind) && Number(a.result?.filled ?? 0) === 0)) continue;
+      for(const side of (['mint','merge'].includes(q.kind)?['Up','Down']:[q.side]) as Side[])
+        if (!found.some(p=>p.marketId===q.market.id&&p.side===side)) found.push({marketId:q.market.id,side,label:`${q.market.asset} ${side} · ${q.market.id.slice(2,8)}`});
+    }
+    let lag=false;
+    try {
+      for(const p of await dex.portfolio(address)) for(const side of ['Up','Down'] as Side[]) {
+        if ((side==='Up'?p.balanceYes:p.balanceNo)>0n && !found.some(x=>x.marketId===p.market.id&&x.side===side))
+          found.push({marketId:p.market.id,side,label:`${p.market.asset} ${side} · ${p.market.id.slice(2,8)}`});
+      }
+    } catch { lag=true; }
+    return {found,lag};
+  }
 
   // Telegraf's default handler rethrows, and that rejection aborts the
   // long-polling loop: one over-long handler leaves a live process that
@@ -107,6 +134,41 @@ export function buildBot(injected?: Services, token = settings.token) {
       ...options.choices.map(c=>[button(u.id,c.label,{op:'quote',marketId:ref.marketId,...c})]),
       [button(u.id,'Check locked orders',{op:'orders'}),button(u.id,'Refresh exit options',{op:'exit',marketId:ref.marketId,side})],
     ]));
+  }
+  async function closeAll(ctx:Context) {
+    const u=user(ctx),s=session(u.id);
+    s.mode='close_all';s.modeAt=Date.now();delete s.awaiting;ledger.setSession(u.id,s);
+    const {found,lag}=await heldPositions(u.id,u.address);
+    if(!found.length){
+      await ctx.reply(`I found no open position balances.${lag?' The indexer is unavailable, so try /positions again shortly.':''}`);
+      return;
+    }
+    const checked=await Promise.allSettled(found.slice(0,50).map(async ref=>({ref,options:await dex.exitOptions(u.address,ref.marketId,ref.side)})));
+    const plans=checked.flatMap(plan=>plan.status==='fulfilled' && BigInt(plan.value.options.held)>0n ? [plan.value] : []);
+    const failed=checked.filter(plan=>plan.status==='rejected').length;
+    if(!plans.length){
+      await ctx.reply(`I checked the recorded positions but found no remaining on-chain shares.${failed?' Some positions were temporarily unavailable; say “all” to retry.':''}`);
+      return;
+    }
+    await ctx.reply(`<b>Close all positions</b>\nI found ${plans.length} held outcome${plans.length===1?'':'s'} with on-chain balances. Below are the available exit routes for everything you hold. Each DreamDEX market needs its own reviewed transaction, with balances over 100 shares split across transactions. After one confirms, use Continue to refresh what remains.`,{parse_mode:'HTML'});
+    const mergeShown=new Set<string>();
+    for(const plan of plans.slice(0,20)){
+      const {ref,options}=plan;
+      const choices=options.choices.filter(c=>{
+        if(c.kind!=='merge')return true;
+        if(mergeShown.has(ref.marketId))return false;
+        mergeShown.add(ref.marketId);return true;
+      });
+      const rows=choices.map(c=>[button(u.id,
+        c.kind==='sell' ? `Review sale · ${c.amount} ${ref.side}` :
+        c.kind==='merge' ? `Review merge · ${c.amount} pairs` :
+        `Review claim · ${fmt(options.held,options.market)} ${ref.side}`,
+        {op:'quote',marketId:ref.marketId,...c})]);
+      const message=`<b>${escape(options.market.asset)} ${ref.side}</b> · ${fmt(options.held,options.market)} shares\n${escape(options.note)}`;
+      await ctx.reply(message,rows.length?keyboard(rows):{parse_mode:'HTML'});
+    }
+    if(plans.length>20)await ctx.reply(`Showing the first 20 of ${plans.length} held outcomes. Finish these, then say “close all positions” again.`);
+    if(failed)await ctx.reply(`${failed} position${failed===1?' was':'s were'} temporarily unavailable. Say “all” to refresh the close-all plan.`);
   }
   async function onboarding(ctx:Context, stage:number) {
     const u = user(ctx); ledger.stage(u.id,stage);
@@ -194,26 +256,16 @@ export function buildBot(injected?: Services, token = settings.token) {
       return;
     }
     // Persist success before sending Telegram; a delivery failure can never trigger a second trade.
-    await ctx.reply(`<b>Confirmed, ser ✓</b>\n${escape(result.summary)}\n\nTransaction:\n<code>${result.hash}</code>\n\n/positions for your shares · /activity for receipts`,{
-      parse_mode:'HTML',...Markup.inlineKeyboard([[Markup.button.url('View real testnet transaction',`${settings.explorer}/tx/${result.hash}`)]]),
+    const current=session(u.id),continuing=current.mode==='close_all' && Date.now()-(current.modeAt??0)<600_000;
+    await ctx.reply(`<b>Confirmed, ser ✓</b>\n${escape(result.summary)}\n\nTransaction:\n<code>${result.hash}</code>\n\n${continuing?'Continue to refresh the remaining full balances.':'/positions for your shares · /activity for receipts'}`,{
+      parse_mode:'HTML',...Markup.inlineKeyboard([
+        [Markup.button.url('View real testnet transaction',`${settings.explorer}/tx/${result.hash}`)],
+        ...(continuing?[[button(u.id,'Continue closing positions',{op:'close_all'})]]:[]),
+      ]),
     });
   }
   async function positions(ctx:Context,page=0) {
-    const u=user(ctx); const found:Array<{marketId:string;side:Side;label:string}>=[];
-    for (const a of ledger.actions(u.id).filter(a=>a.state==='confirmed')) {
-      const q=a.quote;
-      if(q.kind==='withdraw')continue;
-      if (['cancel','redeem'].includes(q.kind) || (['buy','sell','limit'].includes(q.kind) && Number(a.result?.filled ?? 0) === 0)) continue;
-      for(const side of (['mint','merge'].includes(q.kind)?['Up','Down']:[q.side]) as Side[])
-        if (!found.some(p=>p.marketId===q.market.id&&p.side===side)) found.push({marketId:q.market.id,side,label:`${q.market.asset} ${side} · ${q.market.id.slice(2,8)}`});
-    }
-    let lag=false;
-    try {
-      for(const p of await dex.portfolio(u.address)) for(const side of ['Up','Down'] as Side[]) {
-        if ((side==='Up'?p.balanceYes:p.balanceNo)>0n && !found.some(x=>x.marketId===p.market.id&&x.side===side))
-          found.push({marketId:p.market.id,side,label:`${p.market.asset} ${side} · ${p.market.id.slice(2,8)}`});
-      }
-    } catch { lag=true; }
+    const u=user(ctx),{found,lag}=await heldPositions(u.id,u.address);
     const slice=found.slice(page,page+5);
     await ctx.reply(`<b>Which position?</b>\n${slice.length?'Your five most recent positions on this page. Tap for on-chain shares and P/L.':'No positions found yet. Start with /market.'}${lag?'\nIndexer unavailable; showing the bot’s recorded positions.':''}`,keyboard([
       ...slice.map(p=>[button(u.id,p.label,{op:'position',marketId:p.marketId,side:p.side})]),
@@ -299,6 +351,7 @@ export function buildBot(injected?: Services, token = settings.token) {
       case'wallet':return wallet(ctx);
       case'withdraw':return transfer(ctx);
       case'exit':return exitPosition(ctx,ref);
+      case'close_all':return closeAll(ctx);
       case'orders':return orders(ctx);
       case'redeem':return redeem(ctx);
       case'funded':{
@@ -323,12 +376,13 @@ export function buildBot(injected?: Services, token = settings.token) {
   bot.on('text',async ctx=>{
     const u=user(ctx), text=ctx.message.text.trim(), s=session(u.id);
     if(/^(?:please\s+)?(?:send|transfer|withdraw)\b/i.test(text))return transfer(ctx,text);
+    if(closeAllRequest(text) || (s.mode==='close_all' && Date.now()-(s.modeAt??0)<600_000 && /^(?:yes[, ]*)?(?:all|everything)[.!]?$/i.test(text)))return closeAll(ctx);
     if(closeRequest(text)) {
-      const all=/\b(?:all|every)\b/i.test(text) || /\bpositions\b/i.test(text);
-      // A singular request can use the position the user most recently opened.
-      // A plural/all request always shows the picker instead of guessing scope.
-      if(s.selected && !all)return exitPosition(ctx,{op:'exit',...s.selected});
-      return exitPosition(ctx,undefined,all);
+      const plural=/\bpositions\b/i.test(text);
+      if(plural)return closeAll(ctx);
+      s.mode=undefined;s.modeAt=undefined;ledger.setSession(u.id,s);
+      if(s.selected)return exitPosition(ctx,{op:'exit',...s.selected});
+      return exitPosition(ctx);
     }
     if(/^(?:please\s+)?(?:claim|redeem)\b/i.test(text))return redeem(ctx);
     if(/^(?:show |check )?(?:my )?(?:wallet|balance)[.!]?$/i.test(text))return wallet(ctx);
