@@ -1,10 +1,10 @@
 import { SomniaMarkets, SOMNIA_TESTNET_ADDRESSES, isBinaryMarket, ORDER_TYPE, orderBookEventsAbi, type PlaceOrderResult, type OrderFill } from '@somnia-chain/markets-sdk';
-import { createPublicClient, decodeEventLog, keccak256, erc20Abi, formatUnits, http, parseAbi, type Account, type Address, type Hex } from 'viem';
+import { createPublicClient, createWalletClient, encodeFunctionData, getAddress, isAddress, zeroAddress, decodeEventLog, keccak256, erc20Abi, formatUnits, http, parseAbi, type Account, type Address, type Hex } from 'viem';
 import { settings, chain } from './settings.js';
 import { privateKeyToAccount } from 'viem/accounts';
 import { Wallets } from './wallets.js';
 import { units, sizeBudget, receiptFills } from './math.js';
-import type { Action, ActionKind, Execution, MarketView, PositionView, Quote, Side } from './types.js';
+import type { Action, ActionKind, Execution, MarketView, PositionView, Quote, TransferQuote, Side } from './types.js';
 
 const poolAbi = parseAbi([
   'function getBinaryPoolParams() view returns ((address collateralToken, address market, address outcomeToken, uint256 yesId, uint256 noId, uint256 oneCollateral, uint256 setBacking, address feeRecipient, uint256 makerFeeBpsTimes1k, uint256 takerFeeBpsTimes1k, uint256 maxBuilderFeeBpsTimes1k, uint256 settlementFeeBpsTimes1k, address settlement, uint64 marketNonce, bool finalized))',
@@ -26,6 +26,95 @@ export class DreamDex {
       this.public.readContract({address: settings.collateral, abi: erc20Abi, functionName: 'decimals'}),
     ]);
     return {stt, collateral, decimals};
+  }
+  async transferQuote(address: Address, recipient: string, amount: string): Promise<TransferQuote> {
+    if (!isAddress(recipient) || recipient.toLowerCase() === zeroAddress || recipient.toLowerCase() === address.toLowerCase())
+      throw new PreflightError('Enter a valid destination wallet different from this wallet and the zero address.');
+    let quantity: bigint;
+    try { quantity = units(amount, 6); } catch { throw new PreflightError('Use a positive tUSDC amount with at most 6 decimals.'); }
+    if (quantity > units(settings.maxBudget, 6)) throw new PreflightError('The testnet transfer limit is 100 tUSDC per action.');
+    if (await this.public.getChainId() !== chain.id) throw new PreflightError('RPC is not Somnia testnet. Transfer stopped.');
+    const b = await this.balances(address);
+    if (b.decimals !== 6 || b.collateral < quantity) throw new PreflightError('Not enough available tUSDC, or unexpected token decimals. Close or claim positions first.');
+    if (b.stt < 10n ** 16n) throw new PreflightError('Keep at least 0.01 STT for gas.');
+    return {kind:'withdraw', asset:'tUSDC', recipient:getAddress(recipient), token:settings.collateral,
+      chainId:50312, amount, quantity:quantity.toString(), decimals:6, expiresAt:Date.now()+60_000};
+  }
+  private transferReceipt(address: Address, q: TransferQuote, receipt: {transactionHash:Hex; logs: readonly {address:string;data:Hex;topics:readonly Hex[]}[]}): Execution {
+    const paid = receipt.logs.some(log => {
+      if (log.address.toLowerCase() !== q.token.toLowerCase()) return false;
+      try {
+        const event = decodeEventLog({abi:erc20Abi,data:log.data,topics:log.topics as [Hex,...Hex[]]});
+        return event.eventName === 'Transfer' && event.args.from.toLowerCase() === address.toLowerCase()
+          && event.args.to.toLowerCase() === q.recipient.toLowerCase() && event.args.value === BigInt(q.quantity);
+      } catch { return false; }
+    });
+    if (!paid) throw new Error('Transfer receipt did not contain the reviewed token payment. Check /activity.');
+    return {hash:receipt.transactionHash,filled:'0',cash:formatUnits(BigInt(q.quantity),6),
+      summary:`Sent ${formatUnits(BigInt(q.quantity),6)} tUSDC to ${q.recipient} on Somnia Shannon testnet.`};
+  }
+  private transferWallet(account: Account) {
+    return createWalletClient({account,chain,transport:http(settings.rpcUrl,{retryCount:0})});
+  }
+  private async executeTransfer(userId: string, address: Address, q: TransferQuote, journal?: (s: NonNullable<Action['submissions']>[number])=>void): Promise<Execution> {
+    let gas: bigint;
+    try {
+      if (q.expiresAt <= Date.now()) throw new Error('Transfer review expired. Request a new one.');
+      if (q.chainId !== 50312 || q.token.toLowerCase() !== settings.collateral.toLowerCase() || q.decimals !== 6 || q.asset !== 'tUSDC') throw new Error('Unsupported transfer token or network.');
+      const fresh = await this.transferQuote(address,q.recipient,q.amount);
+      if (fresh.quantity !== q.quantity) throw new Error('Transfer amount changed. Request a new review.');
+      const call = {address:q.token,abi:erc20Abi,functionName:'transfer' as const,args:[q.recipient,BigInt(q.quantity)] as const,account:address};
+      const simulation = await this.public.simulateContract(call);
+      if (simulation.result !== true) throw new Error('Token transfer simulation failed.');
+      gas = (await this.public.estimateContractGas(call)) * 12n / 10n;
+    } catch(e) { throw new PreflightError((e as Error).message); }
+    const account = privateKeyToAccount(this.wallets.privateKey(userId));
+    if (account.address.toLowerCase() !== address.toLowerCase()) throw new PreflightError('Wallet identity mismatch.');
+    const wallet = this.transferWallet(account);
+    let request;
+    try {
+      request = await wallet.prepareTransactionRequest({to:q.token,gas,
+        data:encodeFunctionData({abi:erc20Abi,functionName:'transfer',args:[q.recipient,BigInt(q.quantity)]})});
+    } catch { throw new PreflightError('Could not prepare transfer fees and nonce. No transfer was sent. Try again.'); }
+    const balance = await this.public.getBalance({address}).catch(()=>{throw new PreflightError('Could not verify STT gas balance. No transfer was sent.');});
+    const gasPrice = request.maxFeePerGas ?? request.gasPrice;
+    if (gasPrice === undefined || balance < gas * gasPrice + 10n ** 16n) throw new PreflightError('Not enough STT for this transfer plus the 0.01 STT gas reserve.');
+    if (q.expiresAt <= Date.now()) throw new PreflightError('Transfer review expired. Request a new one.');
+    const signed = await wallet.signTransaction(request);
+    const hash = keccak256(signed);
+    journal?.({hash,target:q.token,purpose:'action'});
+    await this.public.sendRawTransaction({serializedTransaction:signed});
+    const receipt = await this.public.waitForTransactionReceipt({hash,timeout:60_000});
+    if (receipt.status !== 'success') throw Object.assign(new Error('Token transfer reverted'),{name:'ContractRevertError'});
+    return this.transferReceipt(address,q,receipt);
+  }
+  /** Read-only exit choices. Every button subsequently creates a fresh review. */
+  async exitOptions(address: Address, marketId: string, side: Side) {
+    const market = await this.market(marketId, false);
+    const oc = await this.exchange.client.getMarketOnchain(market.id);
+    const [up,down] = await Promise.all([oc.yesId,oc.noId].map(id =>
+      this.exchange.client.getOutcomeBalance({outcomeToken:oc.outcomeToken,account:address,id})));
+    const held = side === 'Up' ? up : down;
+    const cap = units(settings.maxBudget,market.decimals);
+    const quantity = held < cap ? held : cap;
+    const pairs = up < down ? up : down;
+    const choices: Array<{kind:ActionKind;side:Side;amount:string;label:string}> = [];
+    if (held === 0n) return {market,held:held.toString(),pairs:pairs.toString(),choices,note:'No unescrowed shares remain on this side. Check /orders for locked shares.'};
+    if (oc.isVoided || (oc.isResolved && oc.winningOutcome === (side === 'Up' ? 0 : 1))) {
+      choices.push({kind:'redeem',side,amount:'0',label:'Review settlement claim'});
+      return {market,held:held.toString(),pairs:pairs.toString(),choices,note:oc.isVoided?'Market voided. Claim this side at the contract payout.':'This side won. Claim collateral without needing order-book liquidity.'};
+    }
+    if (oc.isResolved) return {market,held:held.toString(),pairs:pairs.toString(),choices,note:'This side lost and has no settlement payout.'};
+    if (oc.status !== 1 || oc.finalized || market.expiry <= Date.now()/1000 + settings.minSeconds)
+      return {market,held:held.toString(),pairs:pairs.toString(),choices,note:'The trading window is closing or awaiting settlement. Refresh after resolution to check the payout.'};
+    // Verify the pool generation before suggesting a merge or a sale.
+    await this.live(market);
+    if (pairs > 0n) choices.push({kind:'merge',side,amount:formatUnits(pairs < cap ? pairs : cap,market.decimals),label:'Review complete-set merge'});
+    const fresh = await this.market(marketId);
+    if ((side === 'Up' ? fresh.upBid : fresh.downBid) !== null)
+      choices.push({kind:'sell',side,amount:formatUnits(quantity,market.decimals),label:'Review sale of held shares'});
+    return {market:fresh,held:held.toString(),pairs:pairs.toString(),choices,
+      note:'Merge uses equal Up + Down shares to recover collateral without a buyer. Selling depends on bids and can fill partially. Each action is capped at 100 shares; refresh afterwards for the remainder. These are available routes, not a best-price guarantee.'};
   }
   async market(id: string, withBook = true): Promise<MarketView> {
     if (!/^0x[0-9a-f]{64}$/i.test(id)) throw new PreflightError('Invalid market ID');
@@ -122,7 +211,8 @@ export class DreamDex {
     q.price = (side === 'Up' ? price : scale - price).toString();
     return q;
   }
-  async execute(userId: string, address: Address, q: Quote, journal?: (s: NonNullable<Action['submissions']>[number]) => void): Promise<Execution> {
+  async execute(userId: string, address: Address, q: Quote | TransferQuote, journal?: (s: NonNullable<Action['submissions']>[number]) => void): Promise<Execution> {
+    if (q.kind === 'withdraw') return this.executeTransfer(userId, address, q, journal);
     // Everything before creating the signer is a known no-send failure.
     try {
       if (q.expiresAt <= Date.now()) throw new Error('Quote expired. Request a new one.');
@@ -203,6 +293,7 @@ export class DreamDex {
     if (receipt.from.toLowerCase() !== address.toLowerCase() || receipt.to?.toLowerCase() !== sent.target.toLowerCase())
       throw new Error('Journal receipt identity mismatch');
     if (receipt.status === 'reverted') return {state:'failed'};
+    if (a.quote.kind === 'withdraw') return {state:'confirmed', result:this.transferReceipt(address, a.quote, receipt)};
     const fills: OrderFill[] = []; let orderId: string | undefined;
     for (const log of receipt.logs) {
       if (log.address.toLowerCase() !== a.quote.market.pool.toLowerCase()) continue;
@@ -236,7 +327,7 @@ export class DreamDex {
       status: oc.isVoided ? 'Voided · both sides can claim' : oc.isResolved ? `${oc.winningOutcome === 0 ? 'Up' : 'Down'} won` : oc.status === 1 ? 'Open' : 'Awaiting settlement', asOf: Date.now()};
   }
   async makerStats(address: Address, actions: Action[]): Promise<{volume:number;trades:number;complete:boolean}> {
-    const resting = actions.filter(a=>a.state==='confirmed' && a.quote.kind==='limit' && a.result?.orderId);
+    const resting = actions.filter((a): a is Action & {quote:Quote} => a.state==='confirmed' && a.quote.kind==='limit' && !!a.result?.orderId);
     if (!resting.length) return {volume:0,trades:0,complete:true};
     const orders = new Map(resting.map(a=>[`${a.quote.market.id.toLowerCase()}:${a.result!.orderId}`,a]));
     const markets = [...new Set(resting.map(a=>a.quote.market.id))];

@@ -67,6 +67,37 @@ operate it by hand to take a position.
 Private chats only. This is a **custodial testnet bot**: the server holds
 encrypted keys and signs exactly what the user confirms.
 
+## Exit assistant and transfers
+
+Say **“close my position”** after opening a position card, or use `/close` to
+choose a holding. The assistant reads both on-chain outcome balances and the
+market state, then offers the routes that are currently available:
+
+- **Merge complete sets:** equal held Up + Down shares return collateral without
+  an order-book buyer. This consumes both sides, not just the displayed side.
+- **Sell held shares:** an IOC sale with a price floor. Liquidity can produce a
+  partial or zero fill; the receipt never claims the whole position closed.
+- **Claim settlement:** winning or voided outcomes are redeemed at the contract
+  payout. A losing side and a market awaiting resolution get distinct messages.
+
+Each route opens the existing expiring review. Merge and sell reviews are capped
+at 100 shares; refresh exit options for any remaining holdings. Escrowed shares
+must be unlocked through `/orders`. These are available routes, not an optimal
+execution calculation or a scheduled close.
+
+Then write **`send 10 tUSDC to 0xYourFullDestinationAddress`**, or
+`/withdraw 10 tUSDC to 0xYourFullDestinationAddress`. A separate review displays
+amount, full sender and recipient, token address and chain 50312. Confirming it
+simulates and sends an ERC-20 transfer of available tUSDC, capped at 100 per
+action. The wallet retains at least 0.01 STT after estimated maximum gas.
+Balances, network and expiry are checked again. The receipt must contain the
+exact token transfer; an uncertain broadcast blocks further writes until
+`/activity` reconciles its journaled hash. Destinations never come from the LLM.
+
+This is a custodial **testnet token transfer**, not a bank payout, bridge or
+mainnet withdrawal. Closing and transferring have separate confirmations. No
+background trading or unattended withdrawals are enabled.
+
 ## DreamDEX event contract primitives
 
 The interesting part of this project. Each primitive is used as the venue defines
@@ -197,6 +228,8 @@ which are journaled separately from the action itself.
 | `/wallet` | Deposit address, live balances, faucet links |
 | `/market` | Paginated open markets with live asks |
 | `/positions` | Recent positions and generated P/L cards |
+| `/close` | Choose a position and review merge, sale or settlement routes |
+| `/withdraw` | Review a tUSDC transfer to an explicit wallet address |
 | `/activity` | Transaction journal; recover known mined submissions |
 | `/orders` | List resting orders; review cancellation |
 | `/redeem` | Claimable settled positions, including both void sides |
@@ -262,8 +295,7 @@ current `npm run dev` entry point shares none of their state.
 - Research output is an uncalibrated opinion, not a win probability. Book prices
   alone do not establish an edge, and abstention is a valid answer.
 - A missing or unmined action hash, or an interrupted approval sequence, needs
-  operator investigation. Never blindly clear the journal or resend. There is no
-  automatic private-key export or withdrawal UI.
+  operator investigation. Never blindly clear the journal or resend. Private-key export is not provided. Reviewed tUSDC withdrawals are available with `/withdraw`.
 - tUSDC is test money. A testnet transaction is not a real-dollar settlement.
 - LLM Latency need around 7s to respond
 

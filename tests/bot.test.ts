@@ -134,3 +134,37 @@ test('RPC failures and timeouts reach the agent for chat and /market without dis
   assert(!sent.some(x=>x.includes('private provider detail')));
  }finally{settings.marketTimeoutMs=previous;api.mock.restore();runtime.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+test('exit and transfer conversations create owner-bound reviews, never execute text or reuse superseded confirmations',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'bot-exit-')),ledger=new Ledger(dir),wallets=new Wallets(ledger,dir);
+ const market:MarketView={id:`0x${'a'.repeat(64)}`,pool:`0x${'b'.repeat(40)}`,asset:'BTC',question:'BTC Up?',expiry:Date.now()/1000+3600,tradingStart:0,decimals:6,venueId:'test',upAsk:'450000',downAsk:'570000',upBid:'430000',downBid:'550000'};
+ const recipient=`0x${'2'.repeat(40)}` as const;
+ const sent:any[]=[];let update=0,writes=0,ai=0;
+ const api=mock.method(Telegram.prototype,'callApi',async(_method:string,payload:any)=>{sent.push(payload);return {message_id:sent.length,chat:{id:1,type:'private'}} as any;});
+ const dex={close(){},portfolio:async()=>[],exitOptions:async()=>({market,held:'8000000',pairs:'3000000',note:'Merge paired shares; sale may partially fill.',choices:[{kind:'merge',side:'Up',amount:'3',label:'Review complete-set merge'},{kind:'sell',side:'Up',amount:'8',label:'Review sale of held shares'}]}),
+  market:async()=>market,quote:async(kind:any,m:any,side:any,amount:any)=>({kind,market:m,side,amount,quantity:kind==='merge'?'3000000':'8000000',price:'430000',maxCost:'0',minReceive:'0',expiresAt:Date.now()+60000}),
+  transferQuote:async(_owner:string,dest:string,amount:string)=>{assert.equal(dest,recipient);assert.equal(amount,'10');return {kind:'withdraw',asset:'tUSDC',recipient,token:market.pool,chainId:50312,decimals:6,amount,quantity:'10000000',expiresAt:Date.now()+60000};},
+  execute:async(_id:string,_address:string,q:any)=>{writes++;return {hash:`0x${'c'.repeat(64)}`,filled:q.kind==='sell'?'2':'0',cash:'10',summary:q.kind==='sell'?'2 Up shares filled. Unfilled remainder cancelled.':`Sent 10 tUSDC to ${recipient}`};},
+ } as unknown as DreamDex;
+ const runtime=buildBot({ledger,wallets,dex,agent:async()=>{ai++;throw new Error('AI must not be needed');}},'test-token');
+ runtime.bot.botInfo={id:42,is_bot:true,first_name:'Test',username:'test_bot',can_join_groups:false,can_read_all_group_messages:false,supports_inline_queries:false};
+ const message=(text:string)=>runtime.bot.handleUpdate({update_id:++update,message:{message_id:update,date:1,chat:{id:1,type:'private'},from:{id:1,is_bot:false,first_name:'Alice'},text,...(text.startsWith('/')?{entities:[{offset:0,length:text.split(' ')[0].length,type:'bot_command'}]}:{})}} as any);
+ const button=(label:string)=>sent.flatMap(p=>p.reply_markup?.inline_keyboard?.flat()??[]).filter(b=>b.text===label).at(-1)?.callback_data;
+ const click=(data:string,id=1)=>runtime.bot.handleUpdate({update_id:++update,callback_query:{id:String(update),chat_instance:'1',from:{id,is_bot:false,first_name:'Alice'},data,message:{message_id:1,date:1,chat:{id,type:'private'}}}} as any);
+ try{
+  wallets.ensure('1','Alice');ledger.setSession('1',{selected:{marketId:market.id,side:'Up'},history:[],marketIds:[]});
+  await message('close my position');assert(sent.at(-1).text.includes('Exit assistant'));assert.equal(writes,0);
+  await click(button('Review sale of held shares'));const sale=button('Confirm transaction');
+  assert.equal(ledger.actions('1')[0].quote.kind,'sell');assert.equal(writes,0);
+  await click(sale);assert.equal(writes,1);assert(sent.at(-1).text.includes('Unfilled remainder cancelled'));
+  await message('send all my money');assert(sent.at(-1).text.includes('full destination'));assert.equal(writes,1);
+  await message(`send 10 tUSDC to ${recipient}`);const old=button('Confirm transaction');
+  assert(sent.at(-1).text.includes(recipient));assert(sent.at(-1).text.includes('50312'));assert.equal(writes,1);
+  await message(`/withdraw 10 tUSDC to ${recipient}`);const current=button('Confirm transaction');
+  await click(old);await click(current,2);assert.equal(writes,1);
+  await click(current);await click(current);assert.equal(writes,2);
+  await message('/activity');assert(sent.at(-1).text.includes(`Sent 10 tUSDC to ${recipient}`));
+  await message('/positions');assert(button('BTC Up · aaaaaa'));
+  assert.equal(ai,0);
+ }finally{api.mock.restore();runtime.close();rmSync(dir,{recursive:true,force:true});}
+});

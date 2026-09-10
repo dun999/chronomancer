@@ -75,7 +75,7 @@ export class Ledger {
       return u;
     });
   }
-  prepare(userId: string, quote: Quote): Action {
+  prepare(userId: string, quote: Action['quote']): Action {
     return this.atomic(() => {
       if (this.actions(userId).some(a => ['executing','unknown'].includes(a.state)))
         throw new Error('Your earlier transaction needs reconciliation. Check /activity before making another trade.');

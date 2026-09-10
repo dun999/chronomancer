@@ -330,7 +330,7 @@ footer{border-top:1px solid var(--line);padding:24px 0 34px;position:relative;z-
     <div>
       <p class="eyebrow expose" style="--d:0"><i class="star" aria-hidden="true"></i> Somnia Shannon <b>·</b> chain 50312 <b>·</b> testnet</p>
       <h1 class="expose" style="--d:80">Good times.<br><em>Any time.</em></h1>
-      <p class="lede expose" style="--d:160">Chronomancer is a Telegram sidekick for <strong>DreamDEX event contracts</strong>. Ask it in plain words, read the real two-sided book, confirm one transaction — and let Somnia settle the argument.</p>
+      <p class="lede expose" style="--d:160">Chronomancer is your Telegram assistant for <strong>DreamDEX event contracts</strong>. Open a position, find a way out, claim a payout, and send available test tokens — with a review before every transaction.</p>
       <div class="hero-cta expose" style="--d:230">
         <a class="btn" href="https://t.me/chronomancerrbot" target="_blank" rel="noopener">Open in Telegram <span class="arw" aria-hidden="true">↗</span></a>
         <a class="btn ghost" href="#start">How it works <span class="arw" aria-hidden="true">↓</span></a>
@@ -433,6 +433,22 @@ footer{border-top:1px solid var(--line);padding:24px 0 34px;position:relative;z-
   </div>
 </section>
 
+<section class="sec" id="exit-assistant">
+  <div class="wrap">
+    <div class="rule"><span class="label">The exit assistant</span><span class="line"></span><span class="label">From shares to your wallet</span></div>
+    <div class="head">
+      <h2 class="rise">Getting out deserves<br>an assistant, too.</h2>
+      <p class="lede rise">Ask to close a position. Chronomancer checks your holdings and the market’s state, then shows the available ways to recover collateral. Each action gets its own review.</p>
+    </div>
+    <div class="steps">
+      <article class="step rise"><span class="n">01</span><code>Merge</code><h3>A pair has a way out.</h3><p>Hold both Up and Down? Merge equal shares back into collateral while the market is trading. No buyer needed; both sides are consumed.</p></article>
+      <article class="step rise"><span class="n">02</span><code>Sell</code><h3>Close against real bids.</h3><p>Sell held shares with a price floor. The receipt shows what actually filled. Thin liquidity can leave shares to close later.</p></article>
+      <article class="step rise"><span class="n">03</span><code>Claim</code><h3>Collect after settlement.</h3><p>A winning or voided outcome needs a claim to release its payout. The assistant checks the contract’s state before offering redemption.</p></article>
+      <article class="step rise"><span class="n">04</span><code>Send</code><h3>Choose the destination.</h3><p>Send available tUSDC to a wallet on Somnia Shannon. Review the full address and amount first. Test tokens only; STT stays reserved for gas.</p></article>
+    </div>
+  </div>
+</section>
+
 <section class="sec" id="commands">
   <div class="wrap">
     <div class="rule"><span class="label">Commands</span><span class="line"></span><span class="label">private chats only</span></div>
@@ -441,6 +457,8 @@ footer{border-top:1px solid var(--line);padding:24px 0 34px;position:relative;z-
       <div class="idx rise"><code>/wallet</code><span>Balances and faucets</span></div>
       <div class="idx rise"><code>/market</code><span>Open markets, live asks</span></div>
       <div class="idx rise"><code>/positions</code><span>Last five, with P/L cards</span></div>
+      <div class="idx rise"><code>/close</code><span>Merge, sell or claim a position</span></div>
+      <div class="idx rise"><code>/withdraw</code><span>Send available tUSDC to a wallet</span></div>
       <div class="idx rise"><code>/activity</code><span>Transaction journal</span></div>
       <div class="idx rise"><code>/orders</code><span>Manage resting quotes</span></div>
       <div class="idx rise"><code>/redeem</code><span>Claim settled payouts</span></div>
@@ -452,7 +470,7 @@ footer{border-top:1px solid var(--line);padding:24px 0 34px;position:relative;z-
     <div class="asks">
       <q class="rise">Find a good opportunity</q>
       <q class="rise">10 tUSDC Up on this market</q>
-      <q class="rise">Could you check my position?</q>
+      <q class="rise">Close my position</q>
     </div>
   </div>
 </section>

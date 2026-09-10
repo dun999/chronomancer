@@ -10,6 +10,11 @@ export interface Quote {
   quantity: string; price: string; maxCost: string; minReceive: string;
   orderId?: string; expiresAt: number;
 }
+export interface TransferQuote {
+  kind: 'withdraw'; asset: 'tUSDC'; recipient: `0x${string}`;
+  token: `0x${string}`; chainId: 50312; amount: string; quantity: string;
+  decimals: 6; expiresAt: number;
+}
 export interface Execution {
   hash: string; filled: string; cash: string; orderId?: string;
   summary: string;
@@ -19,7 +24,7 @@ export interface WalletUser {
   stage: number; streak: number; lastDay: string; xp: number; createdAt: number;
 }
 export interface Action {
-  id: string; userId: string; quote: Quote; state: 'pending' | 'executing' | 'confirmed' | 'failed' | 'unknown' | 'cancelled';
+  id: string; userId: string; quote: Quote | TransferQuote; state: 'pending' | 'executing' | 'confirmed' | 'failed' | 'unknown' | 'cancelled';
   createdAt: number; result?: Execution; error?: string;
   submissions?: Array<{hash: `0x${string}`; target: string; purpose: 'action' | 'approval'}>;
 }
@@ -30,7 +35,7 @@ export interface PositionView {
 }
 export interface News { title: string; url: string; date: string; }
 export interface Decision {
-  intent: 'opportunities' | 'buy' | 'positions' | 'activity' | 'markets' | 'explain';
+  intent: 'opportunities' | 'buy' | 'positions' | 'activity' | 'markets' | 'close' | 'withdraw' | 'wallet' | 'redeem' | 'orders' | 'explain';
   reply: string; marketId: string | null; side: Side | null; amount: string | null;
   picks: Array<{marketId: string; side: Side; conviction: 'low' | 'medium'; reason: string; evidence: string[]}>;
 }

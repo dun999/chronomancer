@@ -72,10 +72,32 @@ export function buildBot(injected?: Services, token = settings.token) {
     await ctx.reply(`<b>Your Somnia testnet wallet</b>\n<code>${u.address}</code>\n\nGas: <b>${formatUnits(b.stt,18)} STT</b>\nTrading: <b>${formatUnits(b.collateral,b.decimals)} tUSDC</b>\n\nSend STT for gas and tUSDC for settlement to this address on Somnia Shannon (50312). These are test tokens, not real dollars.`, {
       parse_mode:'HTML',...Markup.inlineKeyboard([
         [Markup.button.url('Get STT',settings.faucet),Markup.button.url('tUSDC faucet group',settings.collateralFaucet)],
+        [button(u.id,'Send tUSDC',{op:'withdraw'})],
         [button(u.id,'I topped up · check balance',{op:'funded'})],
         [Markup.button.url('View wallet',`${settings.explorer}/address/${u.address}`)],
       ]),
     });
+  }
+  async function transfer(ctx:Context, text='') {
+    const u=user(ctx);
+    // Money and destination come only from a full explicit user instruction, never an LLM.
+    const match=text.match(/^(?:\/withdraw|(?:please\s+)?(?:send|transfer|withdraw))\s+(\d+(?:\.\d{1,6})?)\s+tusdc\s+to\s+(0x[0-9a-fA-F]{40})[.!]?$/i);
+    if(!match){await ctx.reply('To send available test tokens, write: send 10 tUSDC to 0xYourDestinationAddress\n\nUse the full destination wallet address on Somnia Shannon (50312). I’ll show the amount and address for review. Close or claim positions first to make their collateral available.');return;}
+    const q=await dex.transferQuote(u.address,match[2],match[1]);
+    const action=ledger.prepare(u.id,q), s=session(u.id);delete s.awaiting;ledger.setSession(u.id,s);
+    await ctx.reply(`<b>Review tUSDC transfer</b>\nAmount: <b>${escape(q.amount)} tUSDC</b>\nFrom: <code>${u.address}</code>\nTo: <code>${q.recipient}</code>\nNetwork: Somnia Shannon testnet (50312)\nToken: <code>${q.token}</code>\n\nThis sends test tokens to the displayed address. STT pays gas; 0.01 STT stays reserved. This is not a bank withdrawal or a bridge. Review expires in 60 seconds.`,keyboard([
+      [button(u.id,'Confirm transaction',{op:'confirm',actionId:action.id}),button(u.id,'Cancel',{op:'cancel',actionId:action.id})],
+    ]));
+  }
+  async function exitPosition(ctx:Context,ref?:Ref) {
+    const u=user(ctx),s=session(u.id);
+    if(!ref?.marketId){await positions(ctx);await ctx.reply('Choose the position, then tap Close position · exit options.');return;}
+    const side=ref.side ?? 'Up', options=await dex.exitOptions(u.address,ref.marketId,side);
+    s.selected={marketId:ref.marketId,side};delete s.awaiting;ledger.setSession(u.id,s);
+    await ctx.reply(`<b>Exit assistant · ${escape(options.market.asset)} ${side}</b>\nMarket: <code>${options.market.id}</code>\nHeld: ${fmt(options.held,options.market)} ${side} shares\nComplete pairs: ${fmt(options.pairs,options.market)}\n\n${escape(options.note)}\n\nNo action has been submitted. After a confirmed close or claim, /wallet shows available collateral and /withdraw lets you send it.`,keyboard([
+      ...options.choices.map(c=>[button(u.id,c.label,{op:'quote',marketId:ref.marketId,...c})]),
+      [button(u.id,'Check locked orders',{op:'orders'}),button(u.id,'Refresh exit options',{op:'exit',marketId:ref.marketId,side})],
+    ]));
   }
   async function onboarding(ctx:Context, stage:number) {
     const u = user(ctx); ledger.stage(u.id,stage);
@@ -171,6 +193,7 @@ export function buildBot(injected?: Services, token = settings.token) {
     const u=user(ctx); const found:Array<{marketId:string;side:Side;label:string}>=[];
     for (const a of ledger.actions(u.id).filter(a=>a.state==='confirmed')) {
       const q=a.quote;
+      if(q.kind==='withdraw')continue;
       if (['cancel','redeem'].includes(q.kind) || (['buy','sell','limit'].includes(q.kind) && Number(a.result?.filled ?? 0) === 0)) continue;
       for(const side of (['mint','merge'].includes(q.kind)?['Up','Down']:[q.side]) as Side[])
         if (!found.some(p=>p.marketId===q.market.id&&p.side===side)) found.push({marketId:q.market.id,side,label:`${q.market.asset} ${side} · ${q.market.id.slice(2,8)}`});
@@ -190,9 +213,11 @@ export function buildBot(injected?: Services, token = settings.token) {
   }
   async function position(ctx:Context,ref:Ref) {
     const u=user(ctx), p=await dex.position(u.address,ref.marketId!,ref.side!);
+    const s=session(u.id);s.selected={marketId:ref.marketId!,side:ref.side!};delete s.awaiting;ledger.setSession(u.id,s);
     await ctx.replyWithPhoto({source:positionCard(p,u.streak)}, {caption:
       `${p.market.asset} ${p.side} · ${p.status}\nShares: ${fmt(p.balance,p.market)}\nUnrealized P/L: ${money(p.pnl,p.market.decimals,true)} tUSDC\nRealized P/L from sells: ${money(p.realized,p.market.decimals,true)} tUSDC\n${p.indexed?'Indexed average-cost estimate, excludes gas.':'Indexer catching up; P/L unavailable.'}`,
       ...Markup.inlineKeyboard([
+        [button(u.id,'Close position · exit options',{op:'exit',marketId:ref.marketId,side:ref.side})],
         [button(u.id,'Sell shares',{op:'amount',marketId:ref.marketId,side:ref.side,kind:'sell'}),button(u.id,'Claim payout',{op:'quote',marketId:ref.marketId,side:ref.side,kind:'redeem',amount:'0'})],
         [button(u.id,'↻ Refresh position',ref)],
       ]),
@@ -205,7 +230,7 @@ export function buildBot(injected?: Services, token = settings.token) {
       if(recovered)ledger.finish(a.id,u.id,recovered.state,recovered.result,recovered.state==='failed'?'Transaction reverted':undefined);
     }
     const all=ledger.actions(u.id), items=all.slice(page,page+8);
-    await ctx.reply(`<b>Your activity</b>\n\n${items.map(a=>`${a.state==='confirmed'?'✓':a.state==='unknown'?'⚠':'·'} <b>${a.state}</b> · ${a.quote.kind} ${escape(a.quote.market.asset)} ${a.quote.side}\n${new Date(a.createdAt).toISOString()}\n${a.result?`${escape(a.result.summary)}\n<a href="${settings.explorer}/tx/${a.result.hash}">Transaction receipt</a>`:escape(a.error ?? 'No confirmed transaction') + (a.submissions ?? []).map(t=>`\n<a href="${settings.explorer}/tx/${t.hash}">${t.purpose} transaction</a>`).join('')}\nRef: <code>${a.id}</code>`).join('\n\n') || 'Nothing here yet. Your confirmed trades will appear here.'}`,keyboard([
+    await ctx.reply(`<b>Your activity</b>\n\n${items.map(a=>`${a.state==='confirmed'?'✓':a.state==='unknown'?'⚠':'·'} <b>${a.state}</b> · ${a.quote.kind} ${a.quote.kind==='withdraw' ? `tUSDC → ${a.quote.recipient}` : `${escape(a.quote.market.asset)} ${a.quote.side}`}\n${new Date(a.createdAt).toISOString()}\n${a.result?`${escape(a.result.summary)}\n<a href="${settings.explorer}/tx/${a.result.hash}">Transaction receipt</a>`:escape(a.error ?? 'No confirmed transaction') + (a.submissions ?? []).map(t=>`\n<a href="${settings.explorer}/tx/${t.hash}">${t.purpose} transaction</a>`).join('')}\nRef: <code>${a.id}</code>`).join('\n\n') || 'Nothing here yet. Your confirmed trades will appear here.'}`,keyboard([
       ...(page+8<all.length?[[button(u.id,'Older activity →',{op:'activity',page:page+8})]]:[]),
     ]));
   }
@@ -250,9 +275,11 @@ export function buildBot(injected?: Services, token = settings.token) {
   bot.command('activity',ctx=>activity(ctx));
   bot.command(['leaderboard','leaders'],ctx=>leaderboard(ctx));
   bot.command('orders',orders);
+  bot.command(['close','exit'],ctx=>exitPosition(ctx));
+  bot.command('withdraw',ctx=>transfer(ctx,ctx.message.text));
   bot.command('redeem',redeem);
   bot.command('advanced',ctx=>advanced(ctx));
-  bot.command(['how','help'],ctx=>ctx.reply('✨ Chronomancer · your DreamDEX sidekick\n\n/start — wallet + guided introduction\n/wallet — balance and funding\n/market — browse open markets\n/positions — last five positions + P/L cards\n/activity — your transaction history\n/leaderboard — the crew’s confirmed trading volume\n/daily — daily check-in streak\n/orders — manage resting orders\n/redeem — claim settled payouts\n/advanced — complete sets and limit orders\n\nOr ask: “Find a good opportunity”, “10 tUSDC Up on this market”, or “Could you check my position?”\n\nTestnet only. Check-ins earn XP; trading more does not extend your streak.'));
+  bot.command(['how','help'],ctx=>ctx.reply('✨ Chronomancer · your DreamDEX sidekick\n\n/start — wallet + guided introduction\n/wallet — balance and funding\n/market — browse open markets\n/positions — last five positions + P/L cards\n/activity — your transaction history\n/leaderboard — the crew’s confirmed trading volume\n/daily — daily check-in streak\n/orders — manage resting orders\n/redeem — claim settled payouts\n/advanced — complete sets and limit orders\n/close — merge, sell or claim a position\n/withdraw — send available tUSDC to a wallet\n\nOr ask: “Find a good opportunity”, “10 tUSDC Up on this market”, or “Could you check my position?”\n\nTestnet only. Check-ins earn XP; trading more does not extend your streak.'));
   bot.command('daily',async ctx=>{const u=user(ctx), c=ledger.checkIn(u.id);await ctx.reply(`🔥 ${c.streak}-day streak · ${c.xp} XP\nDaily check-ins reset at 00:00 UTC. Come back tomorrow—no trade required.`);});
   bot.action(/^r:([a-f0-9]+)$/,async ctx=>{
     await ctx.answerCbQuery();
@@ -261,6 +288,10 @@ export function buildBot(injected?: Services, token = settings.token) {
     switch(ref.op){
       case'intro':return onboarding(ctx,ref.page!);
       case'wallet':return wallet(ctx);
+      case'withdraw':return transfer(ctx);
+      case'exit':return exitPosition(ctx,ref);
+      case'orders':return orders(ctx);
+      case'redeem':return redeem(ctx);
       case'funded':{
         const u=user(ctx),b=await dex.balances(u.address);
         if(b.stt<10n**16n||b.collateral<=0n){await ctx.reply('Still waiting for funding. You need at least 0.01 STT for gas and a positive tUSDC balance.');return wallet(ctx);}
@@ -282,6 +313,14 @@ export function buildBot(injected?: Services, token = settings.token) {
   });
   bot.on('text',async ctx=>{
     const u=user(ctx), text=ctx.message.text.trim(), s=session(u.id);
+    if(/^(?:please\s+)?(?:send|transfer|withdraw)\b/i.test(text))return transfer(ctx,text);
+    if(/^(?:please\s+)?(?:close|exit|cash out|sell)\b/i.test(text)) {
+      // Ambiguous references always open the user's position picker.
+      if(s.selected && /^(?:please\s+)?(?:close|exit|cash out|sell) (?:this|my|the) position[.!]?$/i.test(text))return exitPosition(ctx,{op:'exit',...s.selected});
+      return exitPosition(ctx);
+    }
+    if(/^(?:please\s+)?(?:claim|redeem)\b/i.test(text))return redeem(ctx);
+    if(/^(?:show |check )?(?:my )?(?:wallet|balance)[.!]?$/i.test(text))return wallet(ctx);
     if(/\b(check|show|my)\b.*\bpositions?\b/i.test(text)) return positions(ctx);
     if(/^\/|^help$/i.test(text)){await ctx.reply('Use /help to see the commands.');return;}
     if(s.awaiting && /^\$?\d+(\.\d+)?(?:\s+\d+(\.\d+)?)?$/.test(text)){
@@ -318,6 +357,11 @@ export function buildBot(injected?: Services, token = settings.token) {
     s.history=[...s.history,{role:'user',content:text},{role:'assistant',content:d.reply}].slice(-8) as Session['history'];
     ledger.setSession(u.id,s);
     if(d.intent==='positions')return positions(ctx);
+    if(d.intent==='close')return exitPosition(ctx);
+    if(d.intent==='withdraw')return transfer(ctx);
+    if(d.intent==='wallet')return wallet(ctx);
+    if(d.intent==='redeem')return redeem(ctx);
+    if(d.intent==='orders')return orders(ctx);
     if(d.intent==='activity')return activity(ctx);
     if(d.intent==='markets')return marketList(ctx);
     if(d.intent==='buy'&&d.marketId&&d.side&&d.amount){
